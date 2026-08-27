@@ -91,4 +91,10 @@ type PacketEvent struct {
 	// ICMP only. For echo request/reply, ID carries the echo identifier.
 	ICMPType, ICMPCode uint8
 	ICMPID             uint16
+
+	// Raw is a copy of the whole captured frame, set only when the decoder
+	// runs with KeepRaw (dnsmon uses it for packet export). When KeepRaw is
+	// on, Payload also carries the full transport payload instead of the
+	// MaxSniffPayload-capped prefix.
+	Raw []byte
 }

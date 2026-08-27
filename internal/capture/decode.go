@@ -27,6 +27,11 @@ func (f Filter) match(ev *PacketEvent) bool {
 // Decoder turns raw frames into PacketEvents. Not goroutine-safe: use one
 // Decoder per capture pump goroutine.
 type Decoder struct {
+	// KeepRaw copies the whole frame into each event and lifts the payload
+	// cap — for consumers that export packets (dnsmon). Off by default:
+	// flow tracking only needs the sniff prefix.
+	KeepRaw bool
+
 	parser *gopacket.DecodingLayerParser
 	eth    layers.Ethernet
 	dot1q  layers.Dot1Q
@@ -101,14 +106,14 @@ func (d *Decoder) Decode(data []byte, ci gopacket.CaptureInfo) (PacketEvent, boo
 			ev.Window = d.tcp.Window
 			ev.Flags = tcpFlags(&d.tcp)
 			ev.PayloadLen = len(d.tcp.Payload)
-			ev.Payload = copyPayload(d.tcp.Payload)
+			ev.Payload = d.copyPayload(d.tcp.Payload)
 			haveTransport = true
 		case layers.LayerTypeUDP:
 			ev.Proto = ProtoUDP
 			ev.SrcPort = uint16(d.udp.SrcPort)
 			ev.DstPort = uint16(d.udp.DstPort)
 			ev.PayloadLen = len(d.udp.Payload)
-			ev.Payload = copyPayload(d.udp.Payload)
+			ev.Payload = d.copyPayload(d.udp.Payload)
 			haveTransport = true
 		case layers.LayerTypeICMPv4:
 			ev.Proto = ProtoICMPv4
@@ -130,6 +135,10 @@ func (d *Decoder) Decode(data []byte, ci gopacket.CaptureInfo) (PacketEvent, boo
 	ev.Dst = ev.Dst.Unmap()
 	if !d.filter.match(&ev) {
 		return PacketEvent{}, false
+	}
+	if d.KeepRaw {
+		ev.Raw = make([]byte, len(data))
+		copy(ev.Raw, data)
 	}
 	return ev, true
 }
@@ -157,12 +166,12 @@ func tcpFlags(t *layers.TCP) TCPFlags {
 	return f
 }
 
-func copyPayload(p []byte) []byte {
+func (d *Decoder) copyPayload(p []byte) []byte {
 	if len(p) == 0 {
 		return nil
 	}
 	n := len(p)
-	if n > MaxSniffPayload {
+	if !d.KeepRaw && n > MaxSniffPayload {
 		n = MaxSniffPayload
 	}
 	out := make([]byte, n)

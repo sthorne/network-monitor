@@ -122,6 +122,16 @@ QID, same question), truncated responses (`+TC`), orphan responses that match
 no outstanding query (spoof-shaped or late), and per-side rcode totals. Both
 UDP and TCP (length-prefixed) DNS are parsed.
 
+**Inspector** — press `enter` (or `i`) to open a bottom panel that follows
+the selection as you scroll: a dig-style decode of the selected
+transaction's query and response (header flags, opcode, question, EDNS
+version/UDP size/DO, and every answer/authority/additional record with
+rendered rdata — A, AAAA, CNAME, NS, PTR, MX, TXT, SOA, SRV, CAA; unknown
+types as RFC 3597 hex) plus a full hex+ASCII dump of each message. Press `w`
+to save the selected transaction's captured query and response frames to a
+pcap in the working directory — original timestamps preserved, opens
+directly in Wireshark/tcpdump.
+
 Selected options (see `-h` for all):
 
 | Flag | Default | Meaning |
@@ -134,9 +144,11 @@ Selected options (see `-h` for all):
 ### Keys
 
 ```
-tab ←/→     switch pane            ↑/↓ j/k    scroll (newest first)
-home        follow newest          p          pause display
-c           clear completed        ?          help        q  quit
+tab ←/→     switch pane            ↑/↓ j/k    select (newest first)
+enter i     inspect selected       J/K        scroll inspector panel
+w           save packets to pcap   home       follow newest
+p           pause display          c          clear completed
+?           help                   q          quit
 ```
 
 ## Try it without traffic

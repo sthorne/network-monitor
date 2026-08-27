@@ -48,6 +48,9 @@ func (s TxnState) String() string {
 // Row is a value-type projection of one DNS transaction for the UI. It shares
 // no memory with live tracker state.
 type Row struct {
+	// Seq uniquely identifies the transaction for Tracker.Detail lookups
+	// and for pinning the UI selection across snapshots.
+	Seq   uint64
 	Side  Side
 	Proto capture.Proto
 
@@ -78,6 +81,18 @@ func (r *Row) Latency() time.Duration {
 		return 0
 	}
 	return r.RespTS.Sub(r.QueryTS)
+}
+
+// TxnDetail is the byte-level view of one transaction for the inspector and
+// packet export. Msg slices are the transport payload (DNS message; TCP
+// keeps its length prefix); Frame slices are whole captured frames, empty
+// unless the decoder ran with KeepRaw.
+type TxnDetail struct {
+	Row
+	QueryMsg, RespMsg     []byte
+	QueryFrame, RespFrame []byte
+	QueryWireLen          int // original on-wire frame length (frames may be snapped)
+	RespWireLen           int
 }
 
 // SideStats aggregates one side's transactions at snapshot time.

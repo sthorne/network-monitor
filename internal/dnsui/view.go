@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 
@@ -27,6 +28,10 @@ var (
 	styleBad       = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
 	stylePaused    = lipgloss.NewStyle().Foreground(lipgloss.Color("221")).Bold(true)
 	styleDivider   = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	styleSelected  = lipgloss.NewStyle().Background(lipgloss.Color("237")).Bold(true)
+	styleSelBlur   = lipgloss.NewStyle().Background(lipgloss.Color("235"))
+	styleInspRule  = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
+	styleNotice    = lipgloss.NewStyle().Foreground(lipgloss.Color("114")).Bold(true)
 )
 
 // paneCols is the column layout inside one pane. age is 0 when the pane is
@@ -99,15 +104,19 @@ func (m *model) viewSplit() string {
 	b.WriteByte('\n')
 
 	h := m.listHeight()
-	left, right := m.rows[dnsmon.SideClient], m.rows[dnsmon.SideUpstream]
 	for i := 0; i < h; i++ {
-		b.WriteString(m.renderRow(left, m.scroll[dnsmon.SideClient]+i, lc, true))
+		b.WriteString(m.renderRow(dnsmon.SideClient, m.scroll[dnsmon.SideClient]+i, lc))
 		b.WriteString(div)
-		b.WriteString(m.renderRow(right, m.scroll[dnsmon.SideUpstream]+i, rc, false))
+		b.WriteString(m.renderRow(dnsmon.SideUpstream, m.scroll[dnsmon.SideUpstream]+i, rc))
 		b.WriteByte('\n')
 	}
 
-	b.WriteString(m.footer("tab/←/→ pane · ↑/↓ scroll · home follow · p pause · c clear done · ? help · q quit"))
+	if m.inspector {
+		b.WriteString(m.viewInspector())
+		b.WriteByte('\n')
+	}
+
+	b.WriteString(m.footer("↑/↓ select · enter inspect · w save packet · J/K panel scroll · tab pane · home follow · c clear done · ? help · q quit"))
 	return b.String()
 }
 
@@ -125,21 +134,20 @@ func header(c paneCols, addrLabel string) string {
 	return strings.Join(parts, " ")
 }
 
-// renderRow renders row idx of one pane, or a blank line past the end.
-// withPort shows the querier's source port (meaningful on the client side).
-func (m *model) renderRow(rows []dnsmon.Row, idx int, c paneCols, withPort bool) string {
+// renderRow renders row idx of one pane, or a blank line past the end. The
+// client pane shows the querier with its source port; the upstream pane
+// shows the queried auth server.
+func (m *model) renderRow(side dnsmon.Side, idx int, c paneCols) string {
+	rows := m.rows[side]
 	w := paneWidth(c)
 	if idx < 0 || idx >= len(rows) {
 		return strings.Repeat(" ", w)
 	}
 	r := &rows[idx]
 
-	addr := r.Querier.String()
-	if withPort {
+	addr := r.Server.String()
+	if side == dnsmon.SideClient {
 		addr = ui.Endpoint(r.Querier, r.QuerierPort)
-	} else {
-		// Upstream pane: the interesting address is the queried auth server.
-		addr = r.Server.String()
 	}
 
 	var parts []string
@@ -152,7 +160,16 @@ func (m *model) renderRow(rows []dnsmon.Row, idx int, c paneCols, withPort bool)
 		ui.Pad(dnsmon.TypeName(r.QType), c.qtype),
 		ui.PadLeft(strconv.Itoa(int(r.QID)), c.qid))
 	line := strings.Join(parts, " ") + " "
-	return line + statusCell(r, c.status)
+
+	if idx == m.sel[side] {
+		// Selected rows render unstyled inside a background highlight.
+		plain := line + ui.Pad(statusText(r, c.status), c.status)
+		if side == m.focus {
+			return styleSelected.Render(ui.Pad(plain, w))
+		}
+		return styleSelBlur.Render(ui.Pad(plain, w))
+	}
+	return line + statusStyle(r).Render(ui.Pad(statusText(r, c.status), c.status))
 }
 
 func paneWidth(c paneCols) int {
@@ -163,34 +180,40 @@ func paneWidth(c paneCols) int {
 	return c.age + c.addr + c.qname + c.qtype + c.qid + c.status + (n - 1)
 }
 
-// statusCell renders the transaction outcome, styled by severity.
-func statusCell(r *dnsmon.Row, width int) string {
+// statusText renders the transaction outcome for a cell of the given width.
+func statusText(r *dnsmon.Row, width int) string {
 	switch r.State {
 	case dnsmon.TxnPending:
-		return styleDim.Render(ui.Pad("…", width))
+		return "…"
 	case dnsmon.TxnTimeout:
-		return styleBad.Render(ui.Pad("TIMEOUT", width))
+		return "TIMEOUT"
 	}
 	rcode := dnsmon.RCodeName(r.RCode)
 	if r.TC {
 		rcode += "+TC"
 	}
-	text := rcode
 	if width >= 14 {
-		text = ui.Age(r.Latency()) + " " + rcode
+		return ui.Age(r.Latency()) + " " + rcode
 	}
-	st := styleGood
+	return rcode
+}
+
+// statusStyle picks the severity color for the outcome cell.
+func statusStyle(r *dnsmon.Row) lipgloss.Style {
+	switch r.State {
+	case dnsmon.TxnPending:
+		return styleDim
+	case dnsmon.TxnTimeout:
+		return styleBad
+	}
 	switch r.RCode {
-	case 3: // NXDOMAIN
-		st = styleWarn
+	case 0:
+		return styleGood
 	case 2, 5: // SERVFAIL, REFUSED
-		st = styleBad
+		return styleBad
 	default:
-		if r.RCode != 0 {
-			st = styleWarn
-		}
+		return styleWarn
 	}
-	return st.Render(ui.Pad(text, width))
 }
 
 func (m *model) statusBar() string {
@@ -241,5 +264,8 @@ func resolverLabel(s dnsmon.Snapshot) string {
 }
 
 func (m *model) footer(hints string) string {
+	if m.notice != "" && time.Since(m.noticeAt) < 5*time.Second {
+		return styleNotice.Render(ui.Truncate(" "+m.notice, m.width))
+	}
 	return styleFooter.Render(ui.Truncate(" "+hints, m.width))
 }

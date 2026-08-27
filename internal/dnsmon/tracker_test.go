@@ -221,6 +221,52 @@ func TestNonDNSIgnored(t *testing.T) {
 	}
 }
 
+func TestDetailBytes(t *testing.T) {
+	tr := newTestTracker(DefaultConfig())
+
+	q := buildMsg(0x0abc, 0x0100, "detail.example.com", 1)
+	qFrame := append([]byte{0xee, 0xee}, q...) // stand-in for a captured frame
+	ev := udpEvent(t0, clientIP, resolverIP, 54001, 53, q)
+	ev.Raw, ev.WireLen = qFrame, 142
+	tr.apply(&ev)
+
+	r := respMsg(0x0abc, "detail.example.com", 1, 0, 1)
+	rFrame := append([]byte{0xdd, 0xdd}, r...)
+	ev = udpEvent(t0.Add(4*time.Millisecond), resolverIP, clientIP, 53, 54001, r)
+	ev.Raw, ev.WireLen = rFrame, 158
+	tr.apply(&ev)
+
+	seq := snap(tr).Rows[0].Seq
+	if seq == 0 {
+		t.Fatal("row seq not assigned")
+	}
+	rep := make(chan detailReply, 1)
+	tr.handle(detailReq{seq: seq, reply: rep})
+	got := <-rep
+	if !got.ok {
+		t.Fatal("detail lookup failed")
+	}
+	d := got.detail
+	if string(d.QueryMsg) != string(q) || string(d.RespMsg) != string(r) {
+		t.Error("detail message bytes differ from captured payloads")
+	}
+	if string(d.QueryFrame) != string(qFrame) || string(d.RespFrame) != string(rFrame) {
+		t.Error("detail frame bytes differ from captured frames")
+	}
+	if d.QueryWireLen != 142 || d.RespWireLen != 158 {
+		t.Errorf("wire lens = %d/%d, want 142/158", d.QueryWireLen, d.RespWireLen)
+	}
+	if d.Row.Seq != seq || d.Row.QName != "detail.example.com" || d.Row.State != TxnAnswered {
+		t.Errorf("detail row = %+v", d.Row)
+	}
+
+	// Unknown seq misses cleanly.
+	tr.handle(detailReq{seq: 9999, reply: rep})
+	if got := <-rep; got.ok {
+		t.Error("detail for unknown seq should miss")
+	}
+}
+
 func TestTCPTransactions(t *testing.T) {
 	tr := newTestTracker(DefaultConfig())
 

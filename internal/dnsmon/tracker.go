@@ -47,6 +47,7 @@ type txnKey struct {
 }
 
 type txn struct {
+	seq     uint64 // unique per tracker, for Detail lookups from the UI
 	key     txnKey
 	qname   string
 	qtype   uint16
@@ -57,6 +58,15 @@ type txn struct {
 	retries uint32
 
 	queryTS, respTS time.Time
+
+	// Wire bytes for the inspector and packet export. The msg slices are
+	// the transport payload (DNS message, TCP length prefix included); the
+	// frame slices are whole captured frames, present only when the decoder
+	// runs with KeepRaw.
+	queryMsg, respMsg     []byte
+	queryFrame, respFrame []byte
+	queryWireLen          int
+	respWireLen           int
 }
 
 // txnRing is a fixed-capacity circular buffer of transactions in
@@ -111,6 +121,14 @@ func (r *txnRing) filter(fn func(*txn) bool) {
 
 type snapshotReq struct{ reply chan Snapshot }
 type clearReq struct{ reply chan struct{} }
+type detailReq struct {
+	seq   uint64
+	reply chan detailReply
+}
+type detailReply struct {
+	detail TxnDetail
+	ok     bool
+}
 
 // Tracker owns the DNS transaction table. A single goroutine (Run) touches
 // all state; the UI communicates via rendezvous channels, so there are no
@@ -133,6 +151,7 @@ type Tracker struct {
 	resolvers  map[netip.Addr]struct{}
 
 	now        time.Time
+	nextSeq    uint64
 	totalMsgs  uint64
 	totalBytes uint64
 	malformed  uint64
@@ -226,6 +245,23 @@ func (t *Tracker) Snapshot() (Snapshot, bool) {
 	}
 }
 
+// Detail returns the byte-level view of one transaction by its Row.Seq.
+// ok=false when the transaction has been evicted or the tracker stopped.
+func (t *Tracker) Detail(seq uint64) (TxnDetail, bool) {
+	req := detailReq{seq: seq, reply: make(chan detailReply, 1)}
+	select {
+	case t.reqs <- req:
+	case <-t.done:
+		return TxnDetail{}, false
+	}
+	select {
+	case r := <-req.reply:
+		return r.detail, r.ok
+	case <-t.done:
+		return TxnDetail{}, false
+	}
+}
+
 // ClearCompleted removes answered and timed-out transactions, keeping
 // pending ones.
 func (t *Tracker) ClearCompleted() {
@@ -248,6 +284,46 @@ func (t *Tracker) handle(req any) {
 	case clearReq:
 		t.ring.filter(func(x *txn) bool { return x.state == TxnPending })
 		r.reply <- struct{}{}
+	case detailReq:
+		var found *txn
+		t.ring.each(func(x *txn) {
+			if x.seq == r.seq {
+				found = x
+			}
+		})
+		if found == nil {
+			r.reply <- detailReply{}
+			return
+		}
+		r.reply <- detailReply{detail: found.detail(t.side(found)), ok: true}
+	}
+}
+
+// detail deep-copies the transaction's byte-level view.
+func (x *txn) detail(side Side) TxnDetail {
+	return TxnDetail{
+		Row:          x.row(side),
+		QueryMsg:     append([]byte(nil), x.queryMsg...),
+		RespMsg:      append([]byte(nil), x.respMsg...),
+		QueryFrame:   append([]byte(nil), x.queryFrame...),
+		RespFrame:    append([]byte(nil), x.respFrame...),
+		QueryWireLen: x.queryWireLen,
+		RespWireLen:  x.respWireLen,
+	}
+}
+
+// row projects the transaction for the UI.
+func (x *txn) row(side Side) Row {
+	return Row{
+		Seq:     x.seq,
+		Side:    side,
+		Proto:   x.key.proto,
+		Querier: x.key.querier, QuerierPort: x.key.querierPort,
+		Server: x.key.server, ServerPort: x.key.serverPort,
+		QID: x.key.qid, QName: x.qname, QType: x.qtype,
+		State: x.state, RCode: x.rcode, Answers: x.answers,
+		TC: x.tc, Retries: x.retries,
+		QueryTS: x.queryTS, RespTS: x.respTS,
 	}
 }
 
@@ -292,9 +368,12 @@ func (t *Tracker) applyQuery(ev *capture.PacketEvent, msg *Msg) {
 		prev.retries++ // same question re-sent from the same socket
 		return
 	}
+	t.nextSeq++
 	x := &txn{
+		seq: t.nextSeq,
 		key: key, qname: msg.QName, qtype: msg.QType,
 		state: TxnPending, queryTS: ev.TS,
+		queryMsg: ev.Payload, queryFrame: ev.Raw, queryWireLen: ev.WireLen,
 	}
 	if old := t.ring.push(x); old != nil {
 		if old.state == TxnPending {
@@ -320,6 +399,9 @@ func (t *Tracker) applyResponse(ev *capture.PacketEvent, msg *Msg) {
 	x.rcode = msg.RCode
 	x.answers = msg.ANCount
 	x.tc = msg.TC
+	x.respMsg = ev.Payload
+	x.respFrame = ev.Raw
+	x.respWireLen = ev.WireLen
 	delete(t.pending, key)
 }
 
@@ -378,16 +460,7 @@ func (t *Tracker) snapshot() Snapshot {
 	}
 	t.ring.each(func(x *txn) {
 		side := t.side(x)
-		s.Rows = append(s.Rows, Row{
-			Side:    side,
-			Proto:   x.key.proto,
-			Querier: x.key.querier, QuerierPort: x.key.querierPort,
-			Server: x.key.server, ServerPort: x.key.serverPort,
-			QID: x.key.qid, QName: x.qname, QType: x.qtype,
-			State: x.state, RCode: x.rcode, Answers: x.answers,
-			TC: x.tc, Retries: x.retries,
-			QueryTS: x.queryTS, RespTS: x.respTS,
-		})
+		s.Rows = append(s.Rows, x.row(side))
 		st := &s.Sides[side]
 		st.Queries++
 		st.Retries += uint64(x.retries)
