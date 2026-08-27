@@ -124,7 +124,7 @@ func writeStory(t *testing.T, path string) {
 	b.udp(resolver, clientA, 53, 54009, response(0x0777, "tail.example.com", 1, 0, 1))
 }
 
-func runFile(t *testing.T, path string) dnsmon.Snapshot {
+func runFile(t *testing.T, path string) (dnsmon.Snapshot, *dnsmon.Tracker) {
 	t.Helper()
 	src, err := capture.OpenFile(path)
 	if err != nil {
@@ -133,7 +133,7 @@ func runFile(t *testing.T, path string) dnsmon.Snapshot {
 	defer src.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	t.Cleanup(cancel)
 
 	events := make(chan capture.PacketEvent, 4096)
 	cfg := dnsmon.DefaultConfig()
@@ -142,6 +142,7 @@ func runFile(t *testing.T, path string) dnsmon.Snapshot {
 
 	go tracker.Run(ctx)
 	dec := capture.NewDecoder(src.LinkType(), capture.Filter{Port: 53})
+	dec.KeepRaw = true // as cmd/dnsmon configures it
 	if err := capture.Run(ctx, src, dec, events, &capture.Stats{}); err != nil {
 		t.Fatal(err)
 	}
@@ -152,12 +153,12 @@ func runFile(t *testing.T, path string) dnsmon.Snapshot {
 			t.Fatal("tracker stopped")
 		}
 		if s.EOF {
-			return s
+			return s, tracker
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("timed out waiting for EOF snapshot")
-	return dnsmon.Snapshot{}
+	return dnsmon.Snapshot{}, nil
 }
 
 func findRow(s dnsmon.Snapshot, qid uint16) *dnsmon.Row {
@@ -172,7 +173,7 @@ func findRow(s dnsmon.Snapshot, qid uint16) *dnsmon.Row {
 func TestEndToEndPcap(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dns.pcap")
 	writeStory(t, path)
-	snap := runFile(t, path)
+	snap, tracker := runFile(t, path)
 
 	if len(snap.Rows) != 7 {
 		t.Fatalf("transactions = %d, want 7", len(snap.Rows))
@@ -212,5 +213,23 @@ func TestEndToEndPcap(t *testing.T) {
 	// The cache hit produced no upstream row.
 	if r := findRow(snap, 0x1212); r == nil || r.Side != dnsmon.SideClient || r.QType != 28 {
 		t.Errorf("txn 0x1212 = %+v", findRow(snap, 0x1212))
+	}
+
+	// Detail carries the wire bytes for the inspector and pcap export.
+	row := findRow(snap, 0x1111)
+	d, ok := tracker.Detail(row.Seq)
+	if !ok {
+		t.Fatal("Detail lookup failed")
+	}
+	if len(d.QueryMsg) < 12 || len(d.RespMsg) < 12 {
+		t.Fatalf("detail msg bytes = %d/%d, want full DNS messages", len(d.QueryMsg), len(d.RespMsg))
+	}
+	if len(d.QueryFrame) <= len(d.QueryMsg) || len(d.RespFrame) <= len(d.RespMsg) {
+		t.Errorf("detail frames = %d/%d bytes, want whole frames larger than payloads",
+			len(d.QueryFrame), len(d.RespFrame))
+	}
+	det, ok := dnsmon.DecodeDetail(d.RespMsg, false)
+	if !ok || len(det.Questions) != 1 || det.Questions[0].Name != "www.example.com" {
+		t.Errorf("response decode through pipeline = %+v ok=%v", det, ok)
 	}
 }

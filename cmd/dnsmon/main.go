@@ -103,6 +103,9 @@ func run() error {
 	events := make(chan capture.PacketEvent, 4096)
 	stats := &capture.Stats{}
 	dec := capture.NewDecoder(src.LinkType(), capture.Filter{Port: cfg.Port})
+	// Keep whole frames so the inspector can hex-dump full messages and `w`
+	// can export real packets to a pcap.
+	dec.KeepRaw = true
 	tracker := dnsmon.NewTracker(cfg, events)
 
 	pumpErr := make(chan error, 1)
@@ -118,6 +121,7 @@ func run() error {
 		Stats:      stats,
 		SourceName: sourceName,
 		Live:       *readFile == "",
+		LinkType:   src.LinkType(),
 	})
 	// Unblock a live read stuck in recvfrom so the pump goroutine exits.
 	cancel()
