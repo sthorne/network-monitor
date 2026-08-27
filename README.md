@@ -81,6 +81,62 @@ p           pause display          c       clear closed flows
 ?           help                   q       quit
 ```
 
+## dnsmon: DNS from a recursive resolver's perspective
+
+`dnsmon` is a DNS-specific companion tool. It correlates every DNS query with
+its response by (5-tuple, QID) and splits the traffic into the two halves of a
+recursive server: **clients querying the resolver on the left, the resolver
+querying upstream/authoritative servers on the right**. Every transaction row
+shows the client (or auth server) IP, qname, qtype, and DNS message ID, plus
+its outcome — latency and rcode, still pending, or TIMEOUT.
+
+```
+ dnsmon │ LIVE eth0 │ resolver 192.0.2.53 │ cli 812q 809a │ auth 341q 339a │ 120 qps
+ CLIENTS → RESOLVER  812 txns             │ RESOLVER → AUTHS  341 txns
+   AGE CLIENT           QNAME      TYPE  QID STATUS         │  AGE AUTH SERVER  QNAME      TYPE  QID STATUS
+  0.3s 10.1.0.11:54001  www.exam…  A    4369 12ms NOERROR   │ 0.3s 199.43.135…  www.exam…  A    8195 10ms NOERROR
+  1.1s 10.1.0.12:55003  no-such-…  A   13107 6ms NXDOMAIN   │ 1.1s 199.43.135…  no-such-…  A   11565 6ms NXDOMAIN
+  6.2s 10.1.0.11:54003  slow.exa…  NS  21845 6.0s SERVFAIL  │ 6.2s 199.43.135…  slow.exa…  NS  12079 TIMEOUT
+```
+
+```sh
+go build ./cmd/dnsmon
+sudo ./dnsmon                         # live capture on the default-route interface
+sudo ./dnsmon -i eth0 --resolver 192.0.2.53
+./dnsmon --read capture.pcap          # replay a capture in the TUI
+./dnsmon --read capture.pcap --oneshot  # plain-text transaction summary
+```
+
+The resolver identity comes from `--resolver` (comma-separated IPs), or is
+auto-detected: an address seen both *receiving* DNS queries and *sending*
+them is a resolver. Live captures additionally seed detection with the
+capture interface's own addresses, since the tool usually runs on the
+resolver itself. Until an identity is known, transactions default to the
+client side.
+
+Beyond the per-transaction view, dnsmon surfaces: unanswered queries flagged
+`TIMEOUT` (`--query-timeout`, default 5s), client retries (same socket, same
+QID, same question), truncated responses (`+TC`), orphan responses that match
+no outstanding query (spoof-shaped or late), and per-side rcode totals. Both
+UDP and TCP (length-prefixed) DNS are parsed.
+
+Selected options (see `-h` for all):
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--resolver <ips>` | auto | pin the resolver identities |
+| `--port <n>` | 53 | DNS port |
+| `--query-timeout` | 5s | unanswered queries flagged TIMEOUT after this |
+| `--max-txns` | 4096 | retained transactions (oldest evicted) |
+
+### Keys
+
+```
+tab ←/→     switch pane            ↑/↓ j/k    scroll (newest first)
+home        follow newest          p          pause display
+c           clear completed        ?          help        q  quit
+```
+
 ## Try it without traffic
 
 Generate a small scripted capture (HTTP with a retransmission, a refused
@@ -91,6 +147,14 @@ go run ./hack/genpcap -o demo.pcap
 ./netmon --read demo.pcap
 ```
 
+For dnsmon, generate a scripted recursive-resolver capture (full recursion
+walk, a cache hit, NXDOMAIN, SERVFAIL, and an upstream timeout):
+
+```sh
+go run ./hack/gendnspcap -o dns-demo.pcap
+./dnsmon --read dns-demo.pcap
+```
+
 For a live loopback demo: `go run ./hack/echoserver` in one terminal,
 `sudo ./netmon -i lo` in another, then `curl http://127.0.0.1:8080/`.
 
@@ -98,9 +162,12 @@ For a live loopback demo: `go run ./hack/echoserver` in one terminal,
 
 ```
 capture (AF_PACKET / pcap reader → decoder → PacketEvent channel)
-   └─→ flow tracker (single goroutine: flow table, TCP state machine,
-        issue detectors, app-protocol sniffing, host totals, eviction)
-         └─→ TUI (bubbletea; polls value-type snapshots every 500ms)
+   ├─→ flow tracker (single goroutine: flow table, TCP state machine,
+   │    issue detectors, app-protocol sniffing, host totals, eviction)
+   │     └─→ TUI (bubbletea; polls value-type snapshots every 500ms)
+   └─→ dns tracker (dnsmon: transaction table keyed by 5-tuple + QID,
+        query/response correlation, resolver detection, side classification)
+         └─→ split-pane TUI (same snapshot-polling model)
 ```
 
 - The tracker goroutine owns all flow state; the UI only ever sees deep
