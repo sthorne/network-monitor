@@ -15,8 +15,10 @@ udp   10.0.0.5:53555     →  8.8.8.8:53         ACTIVE   DNS (example.com)     
 ```
 
 Pure Go — no libpcap required. Live capture uses a raw `AF_PACKET` socket
-(Linux; needs root or `CAP_NET_RAW`), and pcap/pcapng files are read with
-`gopacket`'s native readers.
+(Linux only; needs root or `CAP_NET_RAW`), and pcap/pcapng files are read with
+`gopacket`'s native readers. Both tools build and run on macOS and Windows
+too: `--read` replay works everywhere, and attempting live capture off Linux
+reports a clear error instead.
 
 ## Features
 
